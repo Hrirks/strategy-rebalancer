@@ -1,0 +1,37 @@
+{
+  "id": "strategy-rebalancer",
+  "name": "Strategy Rebalancer",
+  "version": "1.0.0",
+  "main": "addon.js",
+  "description": "Calculate portfolio drift and generate buy/sell lists to hit target allocations.",
+  "author": "Hrirks",
+  "sdkVersion": "3.0.0",
+  "enabled": true,
+  "permissions": [
+    {
+      "category": "accounts",
+      "functions": ["getAll"],
+      "purpose": "List accounts to select which portfolio to rebalance"
+    },
+    {
+      "category": "portfolio",
+      "functions": ["getHoldings"],
+      "purpose": "Read current holdings and market values to compute drift"
+    },
+    {
+      "category": "settings",
+      "functions": ["get"],
+      "purpose": "Read base currency for display"
+    },
+    {
+      "category": "secrets",
+      "functions": ["get", "set", "delete"],
+      "purpose": "Persist target allocation configuration between sessions"
+    },
+    {
+      "category": "ui",
+      "functions": ["sidebar.addItem", "router.add"],
+      "purpose": "Add rebalancer navigation and page to Wealthfolio"
+    }
+  ]
+}

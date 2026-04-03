@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/addon.js
+addon.js
+
+# Keep the zip so releases can be attached, but it's optional
+# dist/strategy-rebalancer.zip
+
+# Test artefacts
+.playwright-mcp/
+
+# Editor / OS
+.DS_Store
+.vscode/
+*.swp

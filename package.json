@@ -1,0 +1,31 @@
+{
+  "name": "strategy-rebalancer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite build --watch",
+    "dev:server": "wealthfolio dev",
+    "build": "vite build",
+    "type-check": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "bundle": "pnpm build && cp dist/addon.js addon.js && zip -j dist/strategy-rebalancer.zip manifest.json addon.js && rm addon.js"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.62.7",
+    "@wealthfolio/addon-sdk": "latest",
+    "@wealthfolio/ui": "latest",
+    "lucide-react": "^0.460.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "@wealthfolio/addon-dev-tools": "latest",
+    "rollup-plugin-external-globals": "^0.13.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

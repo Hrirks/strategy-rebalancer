@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import type { AddonContext } from '@wealthfolio/addon-sdk';
 import type { TargetAllocation, TargetSlot } from '../types';
 import { validateSlots } from '../utils/rebalance';
@@ -16,12 +16,41 @@ function newSlot(): TargetSlot {
   return { symbol: '', label: '', targetPct: 0 };
 }
 
+/** Derive proportional targets from holdings, rounded to 1 decimal summing to 100 */
+function deriveTargets(holdings: { symbol: string; name: string; value: number }[]): TargetSlot[] {
+  const total = holdings.reduce((s, h) => s + h.value, 0);
+  if (total === 0) return holdings.map((h) => ({ symbol: h.symbol, label: h.name, targetPct: 0 }));
+  const raw = holdings.map((h) => ({
+    symbol: h.symbol,
+    label: h.name,
+    targetPct: Math.round((h.value / total) * 1000) / 10,
+  }));
+  const sum = raw.reduce((s, r) => s + r.targetPct, 0);
+  const diff = Math.round((100 - sum) * 10) / 10;
+  if (diff !== 0 && raw.length > 0) raw[0].targetPct = Math.round((raw[0].targetPct + diff) * 10) / 10;
+  return raw;
+}
+
 export function ConfigPage({ ctx, accountId, onSaved }: Props) {
   const [slots, setSlots] = useState<TargetSlot[]>([newSlot()]);
   const [ceUrl, setCeUrl] = useState('');
+  const [ceStatus, setCeStatus] = useState<'idle' | 'checking' | 'ok' | 'error'>('idle');
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Probe CE URL and update status indicator
+  const probeCe = useCallback(async (url: string) => {
+    const trimmed = url.trim();
+    if (!trimmed) { setCeStatus('idle'); return; }
+    setCeStatus('checking');
+    try {
+      const res = await fetch(`${trimmed.replace(/\/$/, '')}/health`, { signal: AbortSignal.timeout(3000) });
+      setCeStatus(res.ok ? 'ok' : 'error');
+    } catch {
+      setCeStatus('error');
+    }
+  }, []);
 
   useEffect(() => {
     setIsLoading(true);
@@ -30,7 +59,10 @@ export function ConfigPage({ ctx, accountId, onSaved }: Props) {
       ctx.api.secrets.get(CE_URL_KEY),
     ])
       .then(async ([raw, url]) => {
-        if (url) setCeUrl(url);
+        if (url) {
+          setCeUrl(url);
+          probeCe(url);
+        }
 
         if (raw) {
           const all: TargetAllocation[] = JSON.parse(raw);
@@ -41,19 +73,19 @@ export function ConfigPage({ ctx, accountId, onSaved }: Props) {
           }
         }
 
-        // No saved config for this account — pre-fill from current holdings
+        // No saved config for this account — pre-fill proportionally from holdings
         try {
           const holdings = await ctx.api.portfolio.getHoldings(accountId);
-          const fromHoldings: TargetSlot[] = holdings
-            .filter((h) => h.instrument?.symbol)
+          const relevant = holdings
+            .filter((h) => h.instrument?.symbol && (h.marketValue?.base ?? 0) > 0)
             .map((h) => ({
               symbol: h.instrument!.symbol,
-              label: h.instrument!.name ?? h.instrument!.symbol,
-              targetPct: 0,
+              name: h.instrument!.name ?? h.instrument!.symbol,
+              value: h.marketValue?.base ?? 0,
             }));
-          if (fromHoldings.length > 0) setSlots(fromHoldings);
+          if (relevant.length > 0) setSlots(deriveTargets(relevant));
         } catch {
-          // silently fall back to a single empty slot (already the default)
+          // silently fall back to a single empty slot
         }
       })
       .catch(() => {})
@@ -160,7 +192,18 @@ export function ConfigPage({ ctx, accountId, onSaved }: Props) {
 
       {/* Conviction Engine URL */}
       <div className="space-y-2 pt-2 border-t">
-        <h3 className="text-sm font-semibold">Conviction Engine (optional)</h3>
+        <div className="flex items-center gap-2">
+          <h3 className="text-sm font-semibold">Conviction Engine (optional)</h3>
+          {ceStatus === 'checking' && (
+            <span className="text-xs text-muted-foreground">checking…</span>
+          )}
+          {ceStatus === 'ok' && (
+            <span className="text-xs text-green-600 font-medium">● connected</span>
+          )}
+          {ceStatus === 'error' && (
+            <span className="text-xs text-red-500 font-medium">● unreachable</span>
+          )}
+        </div>
         <p className="text-xs text-muted-foreground">
           Enter the base URL of your self-hosted Conviction Engine backend to overlay conviction
           scores on your rebalance analysis. Leave blank to disable.
@@ -170,6 +213,7 @@ export function ConfigPage({ ctx, accountId, onSaved }: Props) {
           placeholder="e.g. https://ce.example.com or http://localhost:8000"
           value={ceUrl}
           onChange={(e) => setCeUrl(e.target.value)}
+          onBlur={(e) => probeCe(e.target.value)}
         />
       </div>
 

@@ -72,3 +72,92 @@ export interface RebalanceResult {
   inflowOrders: InflowOrder[];
   inflowAmount: number;
 }
+
+// ── Conviction Engine supplementary types ─────────────────────────────────────
+
+export interface CeAlert {
+  id: number;
+  ticker: string;
+  alert_type: 'MOAT_BREACH' | 'RANKING_DRIFT' | 'SENTIMENT_DECOUPLING';
+  triggered_at: string;
+  resolved_at: string | null;
+  is_active: boolean;
+  details: Record<string, unknown>;
+}
+
+export interface CeAlertsResponse {
+  total: number;
+  items: CeAlert[];
+}
+
+export interface CeSizingHolding {
+  ticker: string;
+  current_value: number | null;
+  current_pct: number | null;
+  recommended_pct: number;
+  recommended_value: number | null;
+  recommended_shares: number | null;
+  over_under_pct: number | null;
+  kelly_fraction: number;
+  volatility_annual: number;
+  s_total: number | null;
+  current_price: number | null;
+}
+
+export interface CeSizingResponse {
+  total_portfolio_value: number | null;
+  holdings: CeSizingHolding[];
+}
+
+export interface CeDrawdownFlag {
+  ticker: string;
+  current_drawdown: number;
+  historical_mean_drawdown: number;
+  ratio: number;
+}
+
+export interface CeCorrelationReplacement {
+  removed_ticker: string;
+  added_ticker: string;
+  correlation_with: string;
+  correlation_value: number;
+}
+
+export interface CeRiskResponse {
+  date: string;
+  drawdown_flags: CeDrawdownFlag[];
+  final_tier1: string[];
+  replacements: CeCorrelationReplacement[];
+  correlation_matrix: Record<string, Record<string, number>>;
+}
+
+export interface CeBacktestMetrics {
+  total_return: number;
+  sharpe_ratio: number;
+  sortino_ratio: number;
+  max_drawdown: number;
+  hit_rate?: number;
+}
+
+export interface CeBacktestMonthlyReturn {
+  date: string;
+  model_return: number;
+  benchmark_return: number;
+}
+
+export interface CeBacktestHitEntry {
+  ticker: string;
+  entry_date: string;
+  return_12m: number;
+  was_positive: boolean;
+}
+
+export interface CeBacktestResponse {
+  computed_at: string;
+  period_start: string;
+  period_end: string;
+  model: CeBacktestMetrics;
+  benchmark: Omit<CeBacktestMetrics, 'hit_rate'>;
+  monthly_returns: CeBacktestMonthlyReturn[];
+  hit_history: CeBacktestHitEntry[];
+}

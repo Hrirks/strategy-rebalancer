@@ -5,6 +5,13 @@
  * The baseUrl is stored by the user in addon config (secrets).
  */
 
+import type {
+  CeAlertsResponse,
+  CeBacktestResponse,
+  CeRiskResponse,
+  CeSizingResponse,
+} from '../types';
+
 export interface ConvictionScore {
   ticker: string;
   name: string;
@@ -131,6 +138,78 @@ export async function fetchSparklines(baseUrl: string, tickers: string[]): Promi
     return await res.json() as SparklineMap;
   } catch {
     return {};
+  }
+}
+
+/**
+ * Fetch active CE alerts (MOAT_BREACH / RANKING_DRIFT / SENTIMENT_DECOUPLING).
+ * Returns null on any error.
+ */
+export async function fetchAlerts(baseUrl: string): Promise<CeAlertsResponse | null> {
+  const url = baseUrl.trim().replace(/\/$/, '');
+  if (!url) return null;
+  try {
+    const res = await fetch(`${url}/alerts?active_only=true&limit=50`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    return await res.json() as CeAlertsResponse;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch Kelly-inspired position sizing recommendations from CE.
+ * Returns null on any error.
+ */
+export async function fetchSizing(baseUrl: string): Promise<CeSizingResponse | null> {
+  const url = baseUrl.trim().replace(/\/$/, '');
+  if (!url) return null;
+  try {
+    const res = await fetch(`${url}/portfolio/sizing`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+    return await res.json() as CeSizingResponse;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch risk overlay data (drawdown flags + correlation warnings).
+ * Returns null on any error.
+ */
+export async function fetchRisk(baseUrl: string): Promise<CeRiskResponse | null> {
+  const url = baseUrl.trim().replace(/\/$/, '');
+  if (!url) return null;
+  try {
+    const res = await fetch(`${url}/risk`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+    return await res.json() as CeRiskResponse;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch backtest metrics (Sharpe, Sortino, hit rate vs benchmark).
+ * Returns null on any error.
+ */
+export async function fetchBacktest(baseUrl: string): Promise<CeBacktestResponse | null> {
+  const url = baseUrl.trim().replace(/\/$/, '');
+  if (!url) return null;
+  try {
+    const res = await fetch(`${url}/backtest`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    return await res.json() as CeBacktestResponse;
+  } catch {
+    return null;
   }
 }
 

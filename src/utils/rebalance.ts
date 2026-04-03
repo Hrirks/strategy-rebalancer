@@ -8,6 +8,40 @@ import type {
 } from '../types';
 import type { ConvictionMap } from './conviction';
 
+const CONVICTION_SCORE_FLOOR = 10;
+
+/**
+ * Compute conviction-weighted target percentages from the given slots and
+ * conviction map.  Only slots that have a CE score participate in the
+ * weighting; slots without CE data keep their manual target unchanged.
+ *
+ * Weight = max(FLOOR, s_total) / sum(max(FLOOR, s_total) for all CE-covered slots)
+ * then scaled so that the CE-covered slots together take the same total % as
+ * their manual targets sum to.
+ *
+ * Returns a Map<symbol, convictionWeightedPct>.
+ */
+function buildConvictionWeightedTargets(
+  slots: TargetSlot[],
+  conviction: ConvictionMap,
+): Map<string, number> {
+  const withCe = slots.filter((s) => conviction[s.symbol.toUpperCase()] != null);
+  if (withCe.length === 0) return new Map();
+
+  const totalManualPct = withCe.reduce((s, sl) => s + sl.targetPct, 0);
+  const totalScore = withCe.reduce(
+    (s, sl) => s + Math.max(CONVICTION_SCORE_FLOOR, conviction[sl.symbol.toUpperCase()]!.s_total),
+    0,
+  );
+
+  const result = new Map<string, number>();
+  for (const sl of withCe) {
+    const weight = Math.max(CONVICTION_SCORE_FLOOR, conviction[sl.symbol.toUpperCase()]!.s_total) / totalScore;
+    result.set(sl.symbol, weight * totalManualPct);
+  }
+  return result;
+}
+
 /**
  * Build the full rebalance result from current holdings + target allocation.
  *
@@ -37,6 +71,9 @@ export function computeRebalance(
   const portfolioValue = [...valueBySymbol.values()].reduce((s, v) => s + v, 0);
   const totalWithInflow = portfolioValue + inflowAmount;
 
+  // Conviction-weighted targets (only for slots that have CE coverage)
+  const ceWeightedTargets = buildConvictionWeightedTargets(slots, conviction);
+
   // --- Drift rows (based on current portfolio, no inflow) ---
   const driftRows: DriftRow[] = slots.map((slot) => {
     const currentValue = valueBySymbol.get(slot.symbol) ?? 0;
@@ -64,10 +101,12 @@ export function computeRebalance(
     };
   });
 
-  // --- Full rebalance orders (buy/sell to reach target from current total) ---
+  // --- Full rebalance orders (buy/sell to reach conviction-weighted target) ---
   const fullRebalanceOrders: RebalanceOrder[] = [];
   for (const row of driftRows) {
-    const targetValue = (row.targetPct / 100) * portfolioValue;
+    // Use conviction-weighted target if available, else manual target
+    const effectiveTargetPct = ceWeightedTargets.get(row.symbol) ?? row.targetPct;
+    const targetValue = (effectiveTargetPct / 100) * portfolioValue;
     const delta = targetValue - row.currentValue;
     if (Math.abs(delta) < 0.01) continue;
     const ce = conviction[row.symbol.toUpperCase()];
@@ -79,9 +118,10 @@ export function computeRebalance(
       ...(ce && {
         convictionScore: ce.s_total,
         convictionTier: ce.tier,
-        // Sell is CE-confirmed if CE also says TRIM, or tier >= 3, or high risk
+        // CE-confirmed sell: explicitly TRIM-actioned, OR high-risk
+        // (tier >= 3 alone is too broad — most of the universe is tier 3+)
         convictionConfirmsSell: delta < 0
-          ? (ce.action === 'TRIM' || ce.tier >= 3 || ce.is_high_risk)
+          ? (ce.action === 'TRIM' || ce.is_high_risk)
           : undefined,
       }),
     });
@@ -92,15 +132,16 @@ export function computeRebalance(
     return b.amount - a.amount;
   });
 
-  // --- Inflow orders (deploy new cash to fix drift, no selling) ---
+  // --- Inflow orders (deploy new cash using conviction-weighted targets) ---
   const inflowOrders: InflowOrder[] = [];
   if (inflowAmount > 0 && totalWithInflow > 0) {
-    // For each slot, compute how much it needs to reach target in the new total
     const needs: { slot: TargetSlot; need: number }[] = [];
     let totalNeed = 0;
     for (const slot of slots) {
       const currentValue = valueBySymbol.get(slot.symbol) ?? 0;
-      const targetValue = (slot.targetPct / 100) * totalWithInflow;
+      // Use conviction-weighted target if available, else manual target
+      const effectiveTargetPct = ceWeightedTargets.get(slot.symbol) ?? slot.targetPct;
+      const targetValue = (effectiveTargetPct / 100) * totalWithInflow;
       const need = Math.max(0, targetValue - currentValue);
       needs.push({ slot, need });
       totalNeed += need;

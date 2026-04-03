@@ -55,6 +55,11 @@ export function computeRebalance(
         convictionAction: ce.action,
         convictionReason: ce.reason,
         convictionHighRisk: ce.is_high_risk,
+        convictionFScore: ce.f_score,
+        convictionSentScore: ce.s_ent_score,
+        convictionLScore: ce.l_score,
+        convictionRsi: ce.rsi,
+        convictionPlayType: ce.play_type,
       }),
     };
   });

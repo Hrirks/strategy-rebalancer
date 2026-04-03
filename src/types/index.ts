@@ -33,6 +33,16 @@ export interface DriftRow {
   convictionReason?: string;
   /** Whether CE flags this ticker as high-risk */
   convictionHighRisk?: boolean;
+  /** Fundamentals sub-score 0–100 */
+  convictionFScore?: number;
+  /** Sentiment sub-score 0–100 */
+  convictionSentScore?: number;
+  /** Long-term sub-score 0–100 */
+  convictionLScore?: number;
+  /** RSI 14-day (null if unavailable) */
+  convictionRsi?: number | null;
+  /** Play type label from CE */
+  convictionPlayType?: string;
 }
 
 export interface RebalanceOrder {

@@ -1,9 +1,13 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import type { AddonContext, Holding } from '@wealthfolio/addon-sdk';
 import type { TargetAllocation } from '../types';
-import type { ConvictionMap } from '../utils/conviction';
+import type { ConvictionMap, RulesReport, SparklineMap } from '../utils/conviction';
 import { computeRebalance, formatCurrency, formatPct } from '../utils/rebalance';
-import { fetchConvictionScores } from '../utils/conviction';
+import {
+  fetchConvictionScores,
+  fetchRulesCheck,
+  fetchSparklines,
+} from '../utils/conviction';
 
 const STORAGE_KEY = 'target-allocations';
 const CE_URL_KEY = 'conviction-engine-url';
@@ -37,7 +41,7 @@ function TierDot({ tier }: { tier: number | undefined }) {
   return (
     <span
       title={`Conviction Tier ${tier}`}
-      className={`inline-block w-2 h-2 rounded-full ${colors[tier] ?? 'bg-gray-300'}`}
+      className={`inline-block w-2 h-2 rounded-full flex-shrink-0 ${colors[tier] ?? 'bg-gray-300'}`}
     />
   );
 }
@@ -48,12 +52,178 @@ function ScorePill({ score }: { score: number | undefined }) {
   return <span className={`text-xs font-mono font-semibold ${color}`}>{score.toFixed(0)}</span>;
 }
 
+/** Three mini horizontal bars: F (green), S_ent (amber), L (purple) */
+function SubScoreBars({
+  f, s, l,
+}: {
+  f: number | undefined;
+  s: number | undefined;
+  l: number | undefined;
+}) {
+  if (f == null && s == null && l == null) return null;
+  const bars = [
+    { label: 'F', value: f ?? 0, color: '#3fb950' },
+    { label: 'S', value: s ?? 0, color: '#d29922' },
+    { label: 'L', value: l ?? 0, color: '#a371f7' },
+  ];
+  return (
+    <div className="flex flex-col gap-0.5 mt-1 w-28">
+      {bars.map(({ label, value, color }) => (
+        <div key={label} className="flex items-center gap-1">
+          <span className="text-[9px] text-muted-foreground w-3 flex-shrink-0">{label}</span>
+          <div className="flex-1 h-1 rounded-full bg-muted overflow-hidden">
+            <div
+              className="h-full rounded-full"
+              style={{ width: `${Math.min(100, value)}%`, background: color }}
+            />
+          </div>
+          <span className="text-[9px] text-muted-foreground w-5 text-right tabular-nums">
+            {value.toFixed(0)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Play type chip */
+function PlayTypeChip({ playType }: { playType: string | undefined }) {
+  if (!playType || playType === 'Neutral') return null;
+  const styles: Record<string, string> = {
+    'High Conviction':    'bg-green-50 text-green-700 border-green-200',
+    'Medium Opportunity': 'bg-amber-50 text-amber-700 border-amber-200',
+    'Speculative Idea':   'bg-red-50 text-red-600 border-red-200',
+  };
+  const cls = styles[playType] ?? 'bg-muted text-muted-foreground border-border';
+  return (
+    <span className={`inline-flex items-center rounded border px-1 py-px text-[9px] font-semibold leading-tight ${cls}`}>
+      {playType}
+    </span>
+  );
+}
+
+/** RSI indicator — colour-coded value */
+function RsiIndicator({ rsi }: { rsi: number | null | undefined }) {
+  if (rsi == null) return null;
+  const color = rsi > 70 ? 'text-red-500' : rsi < 30 ? 'text-green-600' : 'text-muted-foreground';
+  const label = rsi > 70 ? 'overbought' : rsi < 30 ? 'oversold' : '';
+  return (
+    <span
+      className={`text-[9px] font-mono ${color}`}
+      title={`RSI 14d: ${rsi.toFixed(1)}${label ? ` — ${label}` : ''}`}
+    >
+      RSI {rsi.toFixed(0)}
+    </span>
+  );
+}
+
+/** Inline SVG sparkline for score history */
+function Sparkline({ values }: { values: number[] | undefined }) {
+  if (!values || values.length < 2) return null;
+  const w = 60, h = 20;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const pts = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * w;
+    const y = h - ((v - min) / range) * h;
+    return `${x},${y}`;
+  });
+  const last = values[values.length - 1];
+  const first = values[0];
+  const stroke = last >= first ? '#3fb950' : '#f85149';
+  return (
+    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} className="overflow-visible">
+      <title>{`Score trend: ${first.toFixed(1)} → ${last.toFixed(1)}`}</title>
+      <polyline
+        points={pts.join(' ')}
+        fill="none"
+        stroke={stroke}
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+// ── Behavioral Safeguards expandable row ──────────────────────────────────
+
+function SafeguardRow({
+  ticker,
+  ceUrl,
+}: {
+  ticker: string;
+  ceUrl: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [report, setReport] = useState<RulesReport | null>(null);
+  const [loading, setLoading] = useState(false);
+  const fetchedRef = useRef(false);
+
+  const load = useCallback(async () => {
+    if (fetchedRef.current) return;
+    fetchedRef.current = true;
+    setLoading(true);
+    const r = await fetchRulesCheck(ceUrl, ticker);
+    setReport(r);
+    setLoading(false);
+  }, [ceUrl, ticker]);
+
+  const toggle = () => {
+    if (!open) load();
+    setOpen((v) => !v);
+  };
+
+  if (!ceUrl) return null;
+
+  return (
+    <div className="border-t">
+      <button
+        className="w-full flex items-center gap-2 px-4 py-1.5 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors text-left"
+        onClick={toggle}
+      >
+        {report != null && (
+          <span className={report.all_passed ? 'text-green-600' : 'text-red-500'}>
+            {report.all_passed ? '✓' : '✗'}
+          </span>
+        )}
+        <span>{open ? '▾' : '▸'} Behavioral Safeguards</span>
+        {report != null && !report.all_passed && (
+          <span className="ml-1 inline-flex items-center rounded-full bg-red-100 px-1.5 py-px text-[9px] font-bold text-red-700">
+            {report.rules.filter((r) => !r.passed).length} fail
+          </span>
+        )}
+        {loading && <span className="ml-1 opacity-60">…</span>}
+      </button>
+
+      {open && report && (
+        <div className="px-4 pb-3 space-y-1">
+          {report.rules.map((rule) => (
+            <div
+              key={rule.rule_id}
+              className={`flex items-start gap-2 text-xs rounded px-2 py-1 ${
+                rule.passed ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-800'
+              }`}
+            >
+              <span className="font-bold flex-shrink-0 mt-px">{rule.passed ? '✓' : '✗'}</span>
+              <div className="min-w-0">
+                <span className="font-medium">{rule.label}</span>
+                <span className="ml-1.5 text-[10px] opacity-70">{rule.threshold}</span>
+                <div className="text-[10px] opacity-80 mt-px">{rule.verdict}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {open && !loading && !report && (
+        <p className="px-4 pb-2 text-xs text-muted-foreground">Not in CE universe.</p>
+      )}
+    </div>
+  );
+}
+
 // ── Conviction-weighted suggestion ────────────────────────────────────────
 
-/**
- * Compute suggested target percentages using conviction scores as weights.
- * Returns a map of symbol → suggestedPct, or null if no conviction data is available.
- */
 function computeConvictionSuggestions(
   slots: TargetAllocation['slots'],
   conviction: ConvictionMap,
@@ -64,7 +234,6 @@ function computeConvictionSuggestions(
 
   if (entries.length < 2) return null;
 
-  // Use s_total as weight, with a floor of 10 so nothing gets zeroed out
   const totalScore = entries.reduce((sum, e) => sum + Math.max(10, e.ce!.s_total), 0);
   const result = new Map<string, number>();
   for (const e of entries) {
@@ -72,6 +241,8 @@ function computeConvictionSuggestions(
   }
   return result;
 }
+
+// ── Main component ────────────────────────────────────────────────────────
 
 export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
   const [mode, setMode] = useState<'drift' | 'inflow' | 'full'>('drift');
@@ -86,6 +257,9 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
   const [conviction, setConviction] = useState<ConvictionMap>({});
   const [ceLoading, setCeLoading] = useState(false);
   const [ceError, setCeError] = useState<string | null>(null);
+  const [ceUrl, setCeUrl] = useState('');
+
+  const [sparklines, setSparklines] = useState<SparklineMap>({});
 
   const [showConvictionSuggestions, setShowConvictionSuggestions] = useState(false);
 
@@ -110,10 +284,21 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
       .finally(() => setConfigLoading(false));
 
     ctx.api.secrets.get(CE_URL_KEY)
-      .then((url) => fetchConvictionScores(url ?? ''))
-      .then((map) => {
+      .then(async (url) => {
+        const resolvedUrl = url ?? '';
+        setCeUrl(resolvedUrl);
+        const map = await fetchConvictionScores(resolvedUrl);
         setConviction(map);
-        if (Object.keys(map).length === 0) setCeError(null); // no URL configured — silent
+        if (Object.keys(map).length === 0) setCeError(null);
+        return { map, resolvedUrl };
+      })
+      .then(async ({ map, resolvedUrl }) => {
+        // Load sparklines for all tickers in the map
+        const tickers = Object.keys(map);
+        if (tickers.length > 0 && resolvedUrl) {
+          const sparks = await fetchSparklines(resolvedUrl, tickers);
+          setSparklines(sparks);
+        }
       })
       .catch(() => setCeError('Could not reach Conviction Engine'))
       .finally(() => setCeLoading(false));
@@ -151,7 +336,6 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
     ? computeConvictionSuggestions(config.slots, conviction)
     : null;
 
-  // Count CE-confirmed sells
   const ceConfirmedSells = result.fullRebalanceOrders.filter(
     (o) => o.action === 'SELL' && o.convictionConfirmsSell,
   ).length;
@@ -234,7 +418,7 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
                   <th className="text-right px-4 py-2 font-medium">Drift</th>
                   {hasConviction && (
                     <th className="text-right px-4 py-2 font-medium">
-                      <span title="Conviction tier dot, score, action">Conviction</span>
+                      <span title="Tier · Score · F/S/L bars · Play type · RSI · Action">Conviction</span>
                     </th>
                   )}
                 </tr>
@@ -242,6 +426,7 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
               <tbody>
                 {result.driftRows.map((row) => {
                   const suggestion = convictionSuggestions?.get(row.symbol);
+                  const sparks = sparklines[row.symbol.toUpperCase()];
                   return (
                     <tr key={row.symbol} className="border-t">
                       <td className="px-4 py-2">
@@ -277,16 +462,37 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
                         {formatPct(row.driftPct)}
                       </td>
                       {hasConviction && (
-                        <td className="px-4 py-2 text-right">
-                          <div className="flex items-center justify-end gap-1.5">
-                            <TierDot tier={row.convictionTier} />
-                            <ScorePill score={row.convictionScore} />
-                            <ConvictionBadge action={row.convictionAction} />
-                          </div>
-                          {row.convictionReason && (
-                            <div className="text-[10px] text-muted-foreground text-right mt-0.5 max-w-[160px] ml-auto leading-tight">
-                              {row.convictionReason}
+                        <td className="px-4 py-2 text-right align-top">
+                          {row.convictionTier != null ? (
+                            <div className="flex flex-col items-end gap-1">
+                              {/* Row 1: tier · score · badge */}
+                              <div className="flex items-center gap-1.5">
+                                <TierDot tier={row.convictionTier} />
+                                <ScorePill score={row.convictionScore} />
+                                <ConvictionBadge action={row.convictionAction} />
+                              </div>
+                              {/* Row 2: play type chip */}
+                              <PlayTypeChip playType={row.convictionPlayType} />
+                              {/* Row 3: F/S/L bars */}
+                              <SubScoreBars
+                                f={row.convictionFScore}
+                                s={row.convictionSentScore}
+                                l={row.convictionLScore}
+                              />
+                              {/* Row 4: RSI + sparkline */}
+                              <div className="flex items-center gap-2 mt-0.5">
+                                <RsiIndicator rsi={row.convictionRsi} />
+                                <Sparkline values={sparks} />
+                              </div>
+                              {/* Row 5: reason text */}
+                              {row.convictionReason && (
+                                <div className="text-[10px] text-muted-foreground text-right max-w-[180px] leading-tight">
+                                  {row.convictionReason}
+                                </div>
+                              )}
                             </div>
+                          ) : (
+                            <span className="text-[10px] text-muted-foreground">—</span>
                           )}
                         </td>
                       )}
@@ -295,21 +501,56 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
                 })}
               </tbody>
             </table>
+
+            {/* Behavioral safeguards — one collapsible per row */}
+            {hasConviction && result.driftRows.map((row) => (
+              conviction[row.symbol.toUpperCase()] ? (
+                <SafeguardRow key={row.symbol} ticker={row.symbol.toUpperCase()} ceUrl={ceUrl} />
+              ) : null
+            ))}
           </div>
 
           {hasConviction && (
-            <div className="flex items-center gap-4 text-xs text-muted-foreground">
+            <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
               <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-purple-500 inline-block" /> T1</span>
               <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-blue-500 inline-block" /> T2</span>
               <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-amber-400 inline-block" /> T3</span>
               <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-gray-400 inline-block" /> T4</span>
-              <span>· Score 0–100 · Action from Conviction Engine</span>
+              <span>·</span>
+              <span className="flex items-center gap-1"><span style={{ color: '#3fb950' }}>■</span> F=Fundamentals</span>
+              <span className="flex items-center gap-1"><span style={{ color: '#d29922' }}>■</span> S=Sentiment</span>
+              <span className="flex items-center gap-1"><span style={{ color: '#a371f7' }}>■</span> L=Long-term</span>
+              <span>· Score 0–100 · Action &amp; sparkline from Conviction Engine</span>
             </div>
           )}
           {!hasConviction && (
             <p className="text-xs text-muted-foreground">
               Red drift = overweight (consider selling or under-buying). Green = underweight.
             </p>
+          )}
+
+          {/* Pre-trade checklist launchers */}
+          {hasConviction && ceUrl && (
+            <div className="flex flex-wrap gap-2 pt-1">
+              <span className="text-xs text-muted-foreground self-center">Pre-trade checklist:</span>
+              {result.driftRows.map((row) => {
+                const ce = conviction[row.symbol.toUpperCase()];
+                if (!ce) return null;
+                const ceAppUrl = ceUrl.replace(':8000', ':5174');
+                return (
+                  <a
+                    key={row.symbol}
+                    href={`${ceAppUrl}/checklist?ticker=${row.symbol.toUpperCase()}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-[11px] rounded border border-border px-2 py-0.5 hover:border-primary hover:text-primary transition-colors"
+                    title={`Open pre-trade checklist for ${row.symbol} in Conviction Engine`}
+                  >
+                    ✓ {row.symbol}
+                  </a>
+                );
+              })}
+            </div>
           )}
         </div>
       )}
@@ -343,6 +584,7 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
                 <tbody>
                   {result.inflowOrders.map((o) => {
                     const ce = conviction[o.symbol.toUpperCase()];
+                    const sparks = sparklines[o.symbol.toUpperCase()];
                     return (
                       <tr key={o.symbol} className="border-t">
                         <td className="px-4 py-2">
@@ -357,10 +599,18 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
                             {((o.amount / inflow) * 100).toFixed(1)}%
                           </div>
                           {ce && (
-                            <div className="flex items-center justify-end gap-1 mt-0.5">
-                              <TierDot tier={ce.tier} />
-                              <ScorePill score={ce.s_total} />
-                              <ConvictionBadge action={ce.action} />
+                            <div className="flex flex-col items-end gap-1 mt-0.5">
+                              <div className="flex items-center gap-1">
+                                <TierDot tier={ce.tier} />
+                                <ScorePill score={ce.s_total} />
+                                <ConvictionBadge action={ce.action} />
+                              </div>
+                              <PlayTypeChip playType={ce.play_type} />
+                              <SubScoreBars f={ce.f_score} s={ce.s_ent_score} l={ce.l_score} />
+                              <div className="flex items-center gap-2">
+                                <RsiIndicator rsi={ce.rsi} />
+                                <Sparkline values={sparks} />
+                              </div>
                             </div>
                           )}
                         </td>
@@ -407,53 +657,59 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
                   </tr>
                 </thead>
                 <tbody>
-                  {result.fullRebalanceOrders.map((o) => (
-                    <tr
-                      key={o.symbol}
-                      className={`border-t ${
-                        o.action === 'SELL' && o.convictionConfirmsSell
-                          ? 'bg-red-50/60'
-                          : ''
-                      }`}
-                    >
-                      <td className="px-4 py-2">
-                        <div className="font-medium">{o.label}</div>
-                        <div className="text-xs text-muted-foreground">{o.symbol}</div>
-                      </td>
-                      <td className="px-4 py-2">
-                        <div className="flex items-center gap-1.5">
-                          <span
-                            className={`inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold ${
-                              o.action === 'BUY'
-                                ? 'bg-green-100 text-green-700'
-                                : 'bg-red-100 text-red-700'
-                            }`}
-                          >
-                            {o.action}
-                          </span>
-                          {o.action === 'SELL' && o.convictionConfirmsSell && (
+                  {result.fullRebalanceOrders.map((o) => {
+                    const sparks = sparklines[o.symbol.toUpperCase()];
+                    return (
+                      <tr
+                        key={o.symbol}
+                        className={`border-t ${
+                          o.action === 'SELL' && o.convictionConfirmsSell
+                            ? 'bg-red-50/60'
+                            : ''
+                        }`}
+                      >
+                        <td className="px-4 py-2">
+                          <div className="font-medium">{o.label}</div>
+                          <div className="text-xs text-muted-foreground">{o.symbol}</div>
+                        </td>
+                        <td className="px-4 py-2">
+                          <div className="flex items-center gap-1.5">
                             <span
-                              title="Conviction Engine also recommends reducing this position"
-                              className="text-[10px] font-bold text-red-600"
+                              className={`inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold ${
+                                o.action === 'BUY'
+                                  ? 'bg-green-100 text-green-700'
+                                  : 'bg-red-100 text-red-700'
+                              }`}
                             >
-                              CE ✓
+                              {o.action}
                             </span>
-                          )}
-                        </div>
-                      </td>
-                      <td className="px-4 py-2 text-right tabular-nums font-medium">
-                        {formatCurrency(o.amount, currency)}
-                      </td>
-                      {hasConviction && (
-                        <td className="px-4 py-2 text-right">
-                          <div className="flex items-center justify-end gap-1.5">
-                            <TierDot tier={o.convictionTier} />
-                            <ScorePill score={o.convictionScore} />
+                            {o.action === 'SELL' && o.convictionConfirmsSell && (
+                              <span
+                                title="Conviction Engine also recommends reducing this position"
+                                className="text-[10px] font-bold text-red-600"
+                              >
+                                CE ✓
+                              </span>
+                            )}
                           </div>
                         </td>
-                      )}
-                    </tr>
-                  ))}
+                        <td className="px-4 py-2 text-right tabular-nums font-medium">
+                          {formatCurrency(o.amount, currency)}
+                        </td>
+                        {hasConviction && (
+                          <td className="px-4 py-2 text-right align-top">
+                            <div className="flex flex-col items-end gap-1">
+                              <div className="flex items-center gap-1.5">
+                                <TierDot tier={o.convictionTier} />
+                                <ScorePill score={o.convictionScore} />
+                              </div>
+                              <Sparkline values={sparks} />
+                            </div>
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

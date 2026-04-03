@@ -27,6 +27,25 @@ export interface ConvictionMap {
   [ticker: string]: ConvictionScore;
 }
 
+export interface RuleResult {
+  rule_id: string;
+  label: string;
+  description: string;
+  passed: boolean;
+  value: number | null;
+  threshold: string;
+  verdict: string;
+}
+
+export interface RulesReport {
+  ticker: string;
+  all_passed: boolean;
+  rules: RuleResult[];
+}
+
+/** Map of ticker → array of s_total values (oldest first) */
+export type SparklineMap = Record<string, number[]>;
+
 /**
  * Fetch the execution list from the Conviction Engine and return a ticker→score map.
  * Returns an empty map (no-op) if baseUrl is blank or the request fails.
@@ -77,3 +96,41 @@ export async function fetchConvictionScores(baseUrl: string): Promise<Conviction
     return {};
   }
 }
+
+/**
+ * Fetch behavioral safeguard rules for a single ticker.
+ * Returns null on any error or if the ticker is not in the CE universe.
+ */
+export async function fetchRulesCheck(baseUrl: string, ticker: string): Promise<RulesReport | null> {
+  const url = baseUrl.trim().replace(/\/$/, '');
+  if (!url) return null;
+  try {
+    const res = await fetch(`${url}/rules/check/${encodeURIComponent(ticker)}`, {
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return null;
+    return await res.json() as RulesReport;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch 30-day score history for multiple tickers in one call.
+ * Returns a map of ticker → array of s_total values (oldest→newest).
+ */
+export async function fetchSparklines(baseUrl: string, tickers: string[]): Promise<SparklineMap> {
+  const url = baseUrl.trim().replace(/\/$/, '');
+  if (!url || tickers.length === 0) return {};
+  try {
+    const params = tickers.map((t) => `tickers=${encodeURIComponent(t)}`).join('&');
+    const res = await fetch(`${url}/scores/history/batch?${params}&days=30`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return {};
+    return await res.json() as SparklineMap;
+  } catch {
+    return {};
+  }
+}
+

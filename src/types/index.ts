@@ -41,6 +41,8 @@ export interface DriftRow {
   convictionLScore?: number;
   /** RSI 14-day (null if unavailable) */
   convictionRsi?: number | null;
+  /** Analyst price target gap % — positive = upside remaining */
+  convictionAnalystGap?: number | null;
   /** Play type label from CE */
   convictionPlayType?: string;
 }
@@ -160,4 +162,54 @@ export interface CeBacktestResponse {
   benchmark: Omit<CeBacktestMetrics, 'hit_rate'>;
   monthly_returns: CeBacktestMonthlyReturn[];
   hit_history: CeBacktestHitEntry[];
+}
+
+// ── Journal types ─────────────────────────────────────────────────────────────
+
+export interface CeJournalEntry {
+  id: number;
+  ticker: string;
+  action: 'BUY' | 'SELL' | 'TRIM' | 'WATCH' | 'NOTE';
+  date: string; // ISO date e.g. "2024-01-15"
+  thesis: string | null;
+  score_at_entry: number | null;
+  f_score_at_entry: number | null;
+  s_ent_score_at_entry: number | null;
+  l_score_at_entry: number | null;
+  entry_price: number | null;
+  exit_price: number | null;
+  pnl_pct: number | null;
+  planned_holding_months: number | null;
+  tags: string[];
+  outcome: string | null;
+  thesis_played_out: boolean | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface CeJournalEntryIn {
+  ticker: string;
+  action: 'BUY' | 'SELL' | 'TRIM' | 'WATCH' | 'NOTE';
+  date: string;
+  thesis?: string;
+  score_at_entry?: number | null;
+  f_score_at_entry?: number | null;
+  s_ent_score_at_entry?: number | null;
+  l_score_at_entry?: number | null;
+  entry_price?: number | null;
+  exit_price?: number | null;
+  planned_holding_months?: number | null;
+  tags?: string[];
+  outcome?: string | null;
+  thesis_played_out?: boolean | null;
+}
+
+export interface CeJournalStats {
+  total_entries: number;
+  unique_tickers: number;
+  action_counts: Record<string, number>;
+  reviewed_count: number;
+  win_count: number;
+  win_rate_pct: number | null;
+  avg_score_at_buy: number | null;
 }

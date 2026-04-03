@@ -8,6 +8,9 @@
 import type {
   CeAlertsResponse,
   CeBacktestResponse,
+  CeJournalEntry,
+  CeJournalEntryIn,
+  CeJournalStats,
   CeRiskResponse,
   CeSizingResponse,
 } from '../types';
@@ -27,6 +30,8 @@ export interface ConvictionScore {
   reason: string;
   is_high_risk: boolean;
   rsi: number | null;
+  /** Price vs analyst consensus target — positive = upside remaining, negative = above target */
+  analyst_gap_pct: number | null;
 }
 
 export interface ConvictionMap {
@@ -210,6 +215,107 @@ export async function fetchBacktest(baseUrl: string): Promise<CeBacktestResponse
     return await res.json() as CeBacktestResponse;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Fetch journal entries, optionally filtered by ticker.
+ * Returns empty array on any error.
+ */
+export async function fetchJournalEntries(baseUrl: string, ticker?: string): Promise<CeJournalEntry[]> {
+  const url = baseUrl.trim().replace(/\/$/, '');
+  if (!url) return [];
+  try {
+    const params = ticker ? `?ticker=${encodeURIComponent(ticker)}&limit=200` : '?limit=200';
+    const res = await fetch(`${url}/journal${params}`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return [];
+    return await res.json() as CeJournalEntry[];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Fetch journal aggregate stats.
+ * Returns null on any error.
+ */
+export async function fetchJournalStats(baseUrl: string): Promise<CeJournalStats | null> {
+  const url = baseUrl.trim().replace(/\/$/, '');
+  if (!url) return null;
+  try {
+    const res = await fetch(`${url}/journal/stats`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    return await res.json() as CeJournalStats;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Create a new journal entry.
+ * Returns the created entry or null on error.
+ */
+export async function postJournalEntry(baseUrl: string, body: CeJournalEntryIn): Promise<CeJournalEntry | null> {
+  const url = baseUrl.trim().replace(/\/$/, '');
+  if (!url) return null;
+  try {
+    const res = await fetch(`${url}/journal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    return await res.json() as CeJournalEntry;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Partially update a journal entry by id.
+ * Returns the updated entry or null on error.
+ */
+export async function patchJournalEntry(
+  baseUrl: string,
+  id: number,
+  patch: Partial<CeJournalEntryIn>,
+): Promise<CeJournalEntry | null> {
+  const url = baseUrl.trim().replace(/\/$/, '');
+  if (!url) return null;
+  try {
+    const res = await fetch(`${url}/journal/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    return await res.json() as CeJournalEntry;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Delete a journal entry by id.
+ * Returns true on success.
+ */
+export async function deleteJournalEntry(baseUrl: string, id: number): Promise<boolean> {
+  const url = baseUrl.trim().replace(/\/$/, '');
+  if (!url) return false;
+  try {
+    const res = await fetch(`${url}/journal/${id}`, {
+      method: 'DELETE',
+      signal: AbortSignal.timeout(8000),
+    });
+    return res.status === 204;
+  } catch {
+    return false;
   }
 }
 

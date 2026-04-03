@@ -5,6 +5,9 @@ import type {
   CeAlert,
   CeAlertsResponse,
   CeBacktestResponse,
+  CeJournalEntry,
+  CeJournalStats,
+  CeJournalEntryIn,
   CeRiskResponse,
   CeSizingResponse,
 } from '../types';
@@ -14,10 +17,15 @@ import {
   fetchAlerts,
   fetchBacktest,
   fetchConvictionScores,
+  fetchJournalEntries,
+  fetchJournalStats,
   fetchRisk,
   fetchRulesCheck,
   fetchSizing,
   fetchSparklines,
+  postJournalEntry,
+  patchJournalEntry,
+  deleteJournalEntry,
 } from '../utils/conviction';
 
 const STORAGE_KEY = 'target-allocations';
@@ -244,16 +252,19 @@ function ActionCard({
 }) {
   // Prioritise: held positions that are oversold (RSI < 35) AND analyst gap > 15%
   // Fallback to top BUY items in execution list
-  const picks: Array<{ ticker: string; score: number; action: string; reason: string; rsi: number | null; entryZone: boolean }> = [];
+  const picks: Array<{ ticker: string; score: number; action: string; reason: string; rsi: number | null; analystGap: number | null; entryZone: boolean }> = [];
 
   for (const [ticker, ce] of Object.entries(conviction)) {
     if (ce.action !== 'BUY') continue;
     const isHeld = heldSymbols.has(ticker);
     const oversold = ce.rsi != null && ce.rsi < 35;
+    const analystGapPositive = ce.analyst_gap_pct != null && ce.analyst_gap_pct > 15;
     const highScore = ce.s_total >= 65;
-    const entryZone = isHeld && oversold && highScore;
+    // Full entry zone: held + oversold + analyst gap > 15% + strong score
+    const entryZone = isHeld && oversold && analystGapPositive && highScore;
+    // Fallback: tier 1-2 BUY with strong score (not necessarily entry zone)
     if (entryZone || (ce.tier <= 2 && ce.s_total >= 70)) {
-      picks.push({ ticker, score: ce.s_total, action: ce.action, reason: ce.reason, rsi: ce.rsi, entryZone });
+      picks.push({ ticker, score: ce.s_total, action: ce.action, reason: ce.reason, rsi: ce.rsi, analystGap: ce.analyst_gap_pct, entryZone });
     }
   }
 
@@ -280,7 +291,9 @@ function ActionCard({
             <span className="font-semibold text-sm text-green-900">{p.ticker}</span>
             {p.entryZone && (
               <span className="ml-1.5 text-[10px] font-semibold text-green-700">
-                Entry zone {p.rsi != null ? `· RSI ${p.rsi.toFixed(0)}` : ''}
+                Entry zone
+                {p.rsi != null ? ` · RSI ${p.rsi.toFixed(0)}` : ''}
+                {p.analystGap != null ? ` · +${p.analystGap.toFixed(0)}% to target` : ''}
               </span>
             )}
             <p className="text-xs text-green-800 mt-0.5 leading-tight">{p.reason}</p>
@@ -338,19 +351,31 @@ function AlertsBanner({
 
 // ── Entry timing signal helpers ───────────────────────────────────────────
 
-function EntrySignal({ rsi, score }: { rsi: number | null | undefined; score: number | undefined }) {
+function EntrySignal({ rsi, score, analystGap }: { rsi: number | null | undefined; score: number | undefined; analystGap: number | null | undefined }) {
   if (rsi == null || score == null) return null;
-  if (rsi < 35 && score >= 65) {
+  const oversold = rsi < 35;
+  const gapPositive = analystGap != null && analystGap > 15;
+  if (oversold && score >= 65 && gapPositive) {
     return (
       <span
-        title="Entry zone: oversold RSI + strong conviction"
+        title={`Entry zone: oversold RSI ${rsi.toFixed(0)} + analyst gap ${analystGap!.toFixed(0)}% + strong conviction`}
         className="text-[9px] font-bold text-green-700 bg-green-100 rounded px-1 py-px"
       >
         ENTRY ZONE
       </span>
     );
   }
-  if (rsi > 65) {
+  if (oversold && score >= 65) {
+    return (
+      <span
+        title={`Oversold RSI ${rsi.toFixed(0)} + strong conviction — analyst gap unclear`}
+        className="text-[9px] font-bold text-green-600 bg-green-50 rounded px-1 py-px"
+      >
+        OVERSOLD
+      </span>
+    );
+  }
+  if (rsi > 70) {
     return (
       <span
         title="Wait zone: overbought RSI"
@@ -626,10 +651,394 @@ function MiniBarChart({
   );
 }
 
+// ── Journal Tab ───────────────────────────────────────────────────────────────
+
+const ACTION_COLORS: Record<string, string> = {
+  BUY:   'bg-green-100 text-green-700',
+  WATCH: 'bg-blue-100 text-blue-700',
+  TRIM:  'bg-amber-100 text-amber-700',
+  SELL:  'bg-red-100 text-red-700',
+  NOTE:  'bg-gray-100 text-gray-600',
+};
+
+function JournalTab({
+  ceUrl,
+  conviction,
+  entries,
+  stats,
+  loading,
+  onEntryCreated,
+  onEntryUpdated,
+  onEntryDeleted,
+  onStatsRefresh,
+}: {
+  ceUrl: string;
+  conviction: ConvictionMap;
+  entries: CeJournalEntry[];
+  stats: CeJournalStats | null;
+  loading: boolean;
+  onEntryCreated: (e: CeJournalEntry) => void;
+  onEntryUpdated: (e: CeJournalEntry) => void;
+  onEntryDeleted: (id: number) => void;
+  onStatsRefresh: () => void;
+}) {
+  const today = new Date().toISOString().slice(0, 10);
+  const tickers = Object.keys(conviction).sort();
+
+  // Quick-add form state
+  const [formOpen, setFormOpen] = useState(false);
+  const [formTicker, setFormTicker] = useState('');
+  const [formAction, setFormAction] = useState<CeJournalEntryIn['action']>('BUY');
+  const [formDate, setFormDate] = useState(today);
+  const [formThesis, setFormThesis] = useState('');
+  const [formEntryPrice, setFormEntryPrice] = useState('');
+  const [formHoldingMonths, setFormHoldingMonths] = useState('12');
+  const [formSaving, setFormSaving] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  // Outcome editing state
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editExitPrice, setEditExitPrice] = useState('');
+  const [editThesisPlayed, setEditThesisPlayed] = useState<boolean | null>(null);
+  const [editSaving, setEditSaving] = useState(false);
+
+  // Pre-fill conviction data when ticker selected
+  function handleTickerChange(ticker: string) {
+    setFormTicker(ticker);
+    const ce = conviction[ticker.toUpperCase()];
+    if (ce) {
+      setFormAction(ce.action === 'TRIM' ? 'TRIM' : ce.action === 'BUY' ? 'BUY' : 'WATCH');
+    }
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!formTicker.trim()) { setFormError('Ticker is required'); return; }
+    setFormSaving(true);
+    setFormError(null);
+    const ce = conviction[formTicker.toUpperCase()];
+    const body: CeJournalEntryIn = {
+      ticker: formTicker.toUpperCase(),
+      action: formAction,
+      date: formDate,
+      thesis: formThesis || undefined,
+      score_at_entry: ce?.s_total ?? undefined,
+      f_score_at_entry: ce?.f_score ?? undefined,
+      s_ent_score_at_entry: ce?.s_ent_score ?? undefined,
+      l_score_at_entry: ce?.l_score ?? undefined,
+      entry_price: formEntryPrice ? parseFloat(formEntryPrice) : undefined,
+      planned_holding_months: formHoldingMonths ? parseInt(formHoldingMonths, 10) : undefined,
+    };
+    const created = await postJournalEntry(ceUrl, body);
+    if (created) {
+      onEntryCreated(created);
+      onStatsRefresh();
+      setFormOpen(false);
+      setFormTicker('');
+      setFormThesis('');
+      setFormEntryPrice('');
+      setFormHoldingMonths('12');
+    } else {
+      setFormError('Failed to save entry — check CE connection');
+    }
+    setFormSaving(false);
+  }
+
+  async function handleOutcomeSave(entry: CeJournalEntry) {
+    setEditSaving(true);
+    const patch: Partial<CeJournalEntryIn> = {};
+    if (editExitPrice !== '') patch.exit_price = parseFloat(editExitPrice);
+    if (editThesisPlayed !== null) patch.thesis_played_out = editThesisPlayed;
+    const updated = await patchJournalEntry(ceUrl, entry.id, patch);
+    if (updated) {
+      onEntryUpdated(updated);
+      onStatsRefresh();
+      setEditingId(null);
+    }
+    setEditSaving(false);
+  }
+
+  async function handleDelete(id: number) {
+    if (!window.confirm('Delete this journal entry?')) return;
+    const ok = await deleteJournalEntry(ceUrl, id);
+    if (ok) {
+      onEntryDeleted(id);
+      onStatsRefresh();
+    }
+  }
+
+  if (!ceUrl) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        Configure your Conviction Engine URL to use the journal.
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Stats bar */}
+      {stats && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div className="rounded-lg border p-3">
+            <p className="text-[11px] text-muted-foreground">Total Entries</p>
+            <p className="text-xl font-semibold">{stats.total_entries}</p>
+          </div>
+          <div className="rounded-lg border p-3">
+            <p className="text-[11px] text-muted-foreground">Tickers</p>
+            <p className="text-xl font-semibold">{stats.unique_tickers}</p>
+          </div>
+          <div className="rounded-lg border p-3">
+            <p className="text-[11px] text-muted-foreground">Win Rate</p>
+            <p className="text-xl font-semibold">
+              {stats.win_rate_pct != null ? `${stats.win_rate_pct}%` : '—'}
+            </p>
+            {stats.reviewed_count > 0 && (
+              <p className="text-[10px] text-muted-foreground">{stats.reviewed_count} reviewed</p>
+            )}
+          </div>
+          <div className="rounded-lg border p-3">
+            <p className="text-[11px] text-muted-foreground">Avg BUY Score</p>
+            <p className="text-xl font-semibold">
+              {stats.avg_score_at_buy != null ? stats.avg_score_at_buy.toFixed(1) : '—'}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Action bar */}
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold">Decision Journal</h3>
+        <button
+          className="h-8 px-3 rounded-md bg-primary text-primary-foreground text-xs hover:opacity-90"
+          onClick={() => setFormOpen((v) => !v)}
+        >
+          {formOpen ? 'Cancel' : '+ Log Decision'}
+        </button>
+      </div>
+
+      {/* Quick-add form */}
+      {formOpen && (
+        <form
+          onSubmit={handleSubmit}
+          className="rounded-lg border p-4 space-y-3 bg-muted/30"
+        >
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-muted-foreground block mb-1">Ticker</label>
+              <input
+                list="ce-tickers"
+                className="h-8 w-full rounded border border-input bg-background px-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+                value={formTicker}
+                onChange={(e) => handleTickerChange(e.target.value)}
+                placeholder="e.g. AAPL"
+                required
+              />
+              <datalist id="ce-tickers">
+                {tickers.map((t) => <option key={t} value={t} />)}
+              </datalist>
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground block mb-1">Action</label>
+              <select
+                className="h-8 w-full rounded border border-input bg-background px-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+                value={formAction}
+                onChange={(e) => setFormAction(e.target.value as CeJournalEntryIn['action'])}
+              >
+                {(['BUY', 'SELL', 'TRIM', 'WATCH', 'NOTE'] as const).map((a) => (
+                  <option key={a} value={a}>{a}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground block mb-1">Date</label>
+              <input
+                type="date"
+                className="h-8 w-full rounded border border-input bg-background px-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+                value={formDate}
+                onChange={(e) => setFormDate(e.target.value)}
+                required
+              />
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground block mb-1">Entry Price</label>
+              <input
+                type="number"
+                step="0.01"
+                className="h-8 w-full rounded border border-input bg-background px-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+                value={formEntryPrice}
+                onChange={(e) => setFormEntryPrice(e.target.value)}
+                placeholder="optional"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="text-xs text-muted-foreground block mb-1">Thesis / Notes</label>
+            <textarea
+              rows={2}
+              className="w-full rounded border border-input bg-background px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-ring resize-none"
+              value={formThesis}
+              onChange={(e) => setFormThesis(e.target.value)}
+              placeholder="Why are you making this decision?"
+            />
+          </div>
+
+          {/* CE conviction pre-fill preview */}
+          {formTicker && conviction[formTicker.toUpperCase()] && (() => {
+            const ce = conviction[formTicker.toUpperCase()];
+            return (
+              <p className="text-[11px] text-muted-foreground">
+                CE at entry: score {ce.s_total.toFixed(0)} · F {ce.f_score.toFixed(0)} · S {ce.s_ent_score.toFixed(0)} · L {ce.l_score.toFixed(0)} (auto-saved)
+              </p>
+            );
+          })()}
+
+          {formError && (
+            <p className="text-xs text-red-500">{formError}</p>
+          )}
+
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              className="h-8 px-3 rounded border border-border text-xs hover:bg-muted"
+              onClick={() => setFormOpen(false)}
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={formSaving}
+              className="h-8 px-3 rounded bg-primary text-primary-foreground text-xs hover:opacity-90 disabled:opacity-50"
+            >
+              {formSaving ? 'Saving…' : 'Save Entry'}
+            </button>
+          </div>
+        </form>
+      )}
+
+      {/* Entries list */}
+      {loading && entries.length === 0 ? (
+        <p className="text-sm text-muted-foreground">Loading journal…</p>
+      ) : entries.length === 0 ? (
+        <p className="text-sm text-muted-foreground">No journal entries yet. Log your first decision above.</p>
+      ) : (
+        <div className="space-y-2">
+          {entries.map((entry) => {
+            const isEditing = editingId === entry.id;
+            const actionColor = ACTION_COLORS[entry.action] ?? 'bg-gray-100 text-gray-600';
+            return (
+              <div key={entry.id} className="rounded-lg border p-3 space-y-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-semibold text-sm">{entry.ticker}</span>
+                  <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-semibold ${actionColor}`}>
+                    {entry.action}
+                  </span>
+                  <span className="text-xs text-muted-foreground">{entry.date}</span>
+                  {entry.score_at_entry != null && (
+                    <span className="text-xs text-muted-foreground">Score: {entry.score_at_entry.toFixed(0)}</span>
+                  )}
+                  {entry.entry_price != null && (
+                    <span className="text-xs text-muted-foreground">@ {entry.entry_price.toFixed(2)}</span>
+                  )}
+                  {entry.pnl_pct != null && (
+                    <span className={`text-xs font-semibold ${entry.pnl_pct >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                      {entry.pnl_pct >= 0 ? '+' : ''}{entry.pnl_pct.toFixed(1)}%
+                    </span>
+                  )}
+                  {entry.thesis_played_out != null && (
+                    <span className={`text-[10px] font-semibold ${entry.thesis_played_out ? 'text-green-600' : 'text-red-500'}`}>
+                      {entry.thesis_played_out ? 'THESIS ✓' : 'THESIS ✗'}
+                    </span>
+                  )}
+                  <div className="ml-auto flex gap-1">
+                    <button
+                      className="text-[10px] text-muted-foreground hover:text-foreground px-1"
+                      onClick={() => {
+                        if (isEditing) { setEditingId(null); return; }
+                        setEditingId(entry.id);
+                        setEditExitPrice(entry.exit_price?.toString() ?? '');
+                        setEditThesisPlayed(entry.thesis_played_out ?? null);
+                      }}
+                    >
+                      {isEditing ? 'Cancel' : 'Review'}
+                    </button>
+                    <button
+                      className="text-[10px] text-red-400 hover:text-red-600 px-1"
+                      onClick={() => handleDelete(entry.id)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+
+                {entry.thesis && (
+                  <p className="text-xs text-muted-foreground leading-relaxed">{entry.thesis}</p>
+                )}
+
+                {/* Sub-scores row */}
+                {(entry.f_score_at_entry != null || entry.s_ent_score_at_entry != null || entry.l_score_at_entry != null) && (
+                  <div className="flex gap-3 text-[10px] text-muted-foreground">
+                    {entry.f_score_at_entry != null && <span style={{ color: '#3fb950' }}>F {entry.f_score_at_entry.toFixed(0)}</span>}
+                    {entry.s_ent_score_at_entry != null && <span style={{ color: '#d29922' }}>S {entry.s_ent_score_at_entry.toFixed(0)}</span>}
+                    {entry.l_score_at_entry != null && <span style={{ color: '#a371f7' }}>L {entry.l_score_at_entry.toFixed(0)}</span>}
+                    {entry.planned_holding_months != null && <span>Hold {entry.planned_holding_months}mo</span>}
+                  </div>
+                )}
+
+                {/* Outcome edit panel */}
+                {isEditing && (
+                  <div className="mt-2 pt-2 border-t space-y-2">
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="text-[10px] text-muted-foreground block mb-0.5">Exit Price</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          className="h-7 w-full rounded border border-input bg-background px-2 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                          value={editExitPrice}
+                          onChange={(e) => setEditExitPrice(e.target.value)}
+                          placeholder="optional"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[10px] text-muted-foreground block mb-0.5">Thesis played out?</label>
+                        <div className="flex gap-1 mt-0.5">
+                          {([true, false, null] as const).map((val) => (
+                            <button
+                              key={String(val)}
+                              type="button"
+                              className={`text-[10px] px-2 py-0.5 rounded border ${editThesisPlayed === val ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted-foreground'}`}
+                              onClick={() => setEditThesisPlayed(val)}
+                            >
+                              {val === true ? 'Yes' : val === false ? 'No' : 'N/A'}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                    <button
+                      disabled={editSaving}
+                      className="h-7 px-3 rounded bg-primary text-primary-foreground text-xs hover:opacity-90 disabled:opacity-50"
+                      onClick={() => handleOutcomeSave(entry)}
+                    >
+                      {editSaving ? 'Saving…' : 'Save Outcome'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main component ────────────────────────────────────────────────────────
 
 export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
-  const [mode, setMode] = useState<'drift' | 'inflow' | 'full' | 'risk' | 'backtest'>('drift');
+  const [mode, setMode] = useState<'drift' | 'inflow' | 'full' | 'risk' | 'backtest' | 'journal'>('drift');
   const [inflowInput, setInflowInput] = useState('');
 
   const [holdings, setHoldings] = useState<Holding[]>([]);
@@ -649,6 +1058,10 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
   const [sizing, setSizing] = useState<CeSizingResponse | null>(null);
   const [risk, setRisk] = useState<CeRiskResponse | null>(null);
   const [backtest, setBacktest] = useState<CeBacktestResponse | null>(null);
+
+  const [journalEntries, setJournalEntries] = useState<CeJournalEntry[]>([]);
+  const [journalStats, setJournalStats] = useState<CeJournalStats | null>(null);
+  const [journalLoading, setJournalLoading] = useState(false);
 
   const [showConvictionSuggestions, setShowConvictionSuggestions] = useState(false);
 
@@ -696,6 +1109,18 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
         setSizing(sizingData);
         setRisk(riskData);
         setBacktest(backtestData);
+
+        // Journal — load in background, doesn't block main data
+        if (resolvedUrl) {
+          setJournalLoading(true);
+          Promise.all([
+            fetchJournalEntries(resolvedUrl),
+            fetchJournalStats(resolvedUrl),
+          ]).then(([entries, stats]) => {
+            setJournalEntries(entries);
+            setJournalStats(stats);
+          }).finally(() => setJournalLoading(false));
+        }
       })
       .catch(() => setCeError('Could not reach Conviction Engine'))
       .finally(() => setCeLoading(false));
@@ -737,14 +1162,19 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
     (o) => o.action === 'SELL' && o.convictionConfirmsSell,
   ).length;
 
-  // Held symbols (uppercase) for alert filtering
-  const heldSymbols = new Set(config.slots.map((s) => s.symbol.toUpperCase()));
+  // Held symbols (uppercase) for alert filtering — use actual held positions, not just targets
+  const heldSymbols = new Set(
+    holdings
+      .filter((h) => (h.marketValue?.base ?? 0) > 0)
+      .map((h) => h.instrument?.symbol?.toUpperCase())
+      .filter((s): s is string => Boolean(s)),
+  );
 
   return (
     <div className="space-y-6">
       {/* Mode tabs */}
       <div className="flex gap-1 border-b flex-wrap">
-        {(['drift', 'inflow', 'full', 'risk', 'backtest'] as const).map((m) => (
+        {(['drift', 'inflow', 'full', 'risk', 'backtest', 'journal'] as const).map((m) => (
           <button
             key={m}
             className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
@@ -758,7 +1188,8 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
              m === 'inflow'   ? 'Inflow Mode'     :
              m === 'full'     ? 'Full Rebalance'  :
              m === 'risk'     ? 'Risk'            :
-                                'Backtest'}
+             m === 'backtest' ? 'Backtest'        :
+                                'Journal'}
             {m === 'full' && ceConfirmedSells > 0 && (
               <span className="ml-1.5 inline-flex items-center rounded-full bg-red-100 px-1.5 py-0.5 text-[10px] font-bold text-red-700">
                 {ceConfirmedSells}
@@ -851,7 +1282,7 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
                         )}
                         {/* Entry timing signal */}
                         <div className="mt-0.5">
-                          <EntrySignal rsi={row.convictionRsi} score={row.convictionScore} />
+                          <EntrySignal rsi={row.convictionRsi} score={row.convictionScore} analystGap={row.convictionAnalystGap} />
                         </div>
                       </td>
                       <td className="px-4 py-2 text-right tabular-nums">
@@ -1167,6 +1598,27 @@ export function ResultsPage({ ctx, accountId, currency, onEditConfig }: Props) {
           : <p className="text-sm text-muted-foreground">
               {ceLoading ? 'Loading backtest data…' : ceUrl ? 'No backtest data available yet — run a backtest from the CE backend.' : 'Configure CE URL to see backtest results.'}
             </p>
+      )}
+
+      {/* ── JOURNAL TAB ────────────────────────────────────────────────── */}
+      {mode === 'journal' && (
+        <JournalTab
+          ceUrl={ceUrl}
+          conviction={conviction}
+          entries={journalEntries}
+          stats={journalStats}
+          loading={journalLoading}
+          onEntryCreated={(entry) => setJournalEntries((prev) => [entry, ...prev])}
+          onEntryUpdated={(updated) =>
+            setJournalEntries((prev) => prev.map((e) => (e.id === updated.id ? updated : e)))
+          }
+          onEntryDeleted={(id) =>
+            setJournalEntries((prev) => prev.filter((e) => e.id !== id))
+          }
+          onStatsRefresh={() => {
+            if (ceUrl) fetchJournalStats(ceUrl).then((s) => { if (s) setJournalStats(s); });
+          }}
+        />
       )}
     </div>
   );

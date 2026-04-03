@@ -96,6 +96,7 @@ export function computeRebalance(
         convictionSentScore: ce.s_ent_score,
         convictionLScore: ce.l_score,
         convictionRsi: ce.rsi,
+        convictionAnalystGap: ce.analyst_gap_pct,
         convictionPlayType: ce.play_type,
       }),
     };
